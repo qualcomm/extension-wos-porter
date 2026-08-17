@@ -51,7 +51,7 @@ jobs:
       MAX_AUTOPILOT_CONTINUES: ${{ github.event.inputs.max_autopilot_continues }}
     steps:
       - name: Checkout extension (for agent + instruction sources)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Verify COPILOT_GITHUB_TOKEN is set
         shell: pwsh

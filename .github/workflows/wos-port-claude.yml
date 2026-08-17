@@ -68,7 +68,7 @@ jobs:
       MAX_TURNS: ${{ github.event.inputs.max_turns }}
     steps:
       - name: Checkout extension (for the wos-porter Claude plugin)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Verify auth is configured (direct API or gateway)
         shell: pwsh
