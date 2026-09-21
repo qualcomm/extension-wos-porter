@@ -382,7 +382,7 @@ jobs:
       # ── Download x64 benchmark artifact from Job 1 ──────────────────────────
       - name: Download x64 benchmark results
         if: always()
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: x64-benchmark-*
           path: C:\src\x64-results
