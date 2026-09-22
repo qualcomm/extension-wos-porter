@@ -54,6 +54,78 @@ Wait for the user to supply any missing paths before continuing. Never guess or 
 
 ## Workflow
 
+### Step 0: Verify and Install Dependencies
+
+Before doing anything else, check that all required tools are present. If any are missing, install them automatically and re-verify before continuing.
+
+#### Python 3
+
+```powershell
+$pyCmd = $null
+foreach ($cmd in @("py", "python", "python3")) {
+    if (Get-Command $cmd -ErrorAction SilentlyContinue) { $pyCmd = $cmd; break }
+}
+if (-not $pyCmd) {
+    Write-Host "Python 3 not found. Installing via winget..."
+    winget install --id Python.Python.3 --silent --accept-package-agreements --accept-source-agreements
+    # Refresh PATH for the current session
+    $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH","Machine") + ";" +
+                [System.Environment]::GetEnvironmentVariable("PATH","User")
+    foreach ($cmd in @("py", "python", "python3")) {
+        if (Get-Command $cmd -ErrorAction SilentlyContinue) { $pyCmd = $cmd; break }
+    }
+    if (-not $pyCmd) {
+        Write-Error "ERROR: Python 3 installation failed. Install manually from https://www.python.org and ensure it is on PATH."
+        exit 1
+    }
+    Write-Host "Python 3 installed successfully: $($pyCmd)"
+} else {
+    Write-Host "Python 3 found: $($pyCmd)"
+}
+```
+
+#### Windows Performance Toolkit (`symcachegen.exe` and `wpaexporter.exe`)
+
+Search for the tools in their default Windows ADK/SDK install location first:
+
+```powershell
+$wptRoot = "C:\Program Files (x86)\Windows Kits\10\Windows Performance Toolkit"
+$symcachegen  = Get-Command "symcachegen.exe"  -ErrorAction SilentlyContinue
+$wpaexporter  = Get-Command "wpaexporter.exe"  -ErrorAction SilentlyContinue
+
+if (-not $symcachegen) {
+    $symcachegen = Get-Item "$wptRoot\symcachegen.exe" -ErrorAction SilentlyContinue
+}
+if (-not $wpaexporter) {
+    $wpaexporter = Get-Item "$wptRoot\wpaexporter.exe" -ErrorAction SilentlyContinue
+}
+
+$wptMissing = (-not $symcachegen) -or (-not $wpaexporter)
+
+if ($wptMissing) {
+    Write-Host "Windows Performance Toolkit not found. Installing Windows ADK via winget..."
+    winget install --id Microsoft.WindowsADK --silent --accept-package-agreements --accept-source-agreements
+    # Re-check after install
+    $symcachegen = Get-Item "$wptRoot\symcachegen.exe" -ErrorAction SilentlyContinue
+    $wpaexporter = Get-Item "$wptRoot\wpaexporter.exe" -ErrorAction SilentlyContinue
+    if (-not $symcachegen -or -not $wpaexporter) {
+        Write-Error "ERROR: Windows Performance Toolkit installation failed or tools not found at '$wptRoot'. Install the Windows ADK manually from https://learn.microsoft.com/windows-hardware/get-started/adk-install and ensure the Windows Performance Toolkit feature is selected."
+        exit 1
+    }
+    Write-Host "Windows Performance Toolkit installed successfully."
+} else {
+    Write-Host "symcachegen.exe found: $($symcachegen.Source ?? $symcachegen.FullName)"
+    Write-Host "wpaexporter.exe found: $($wpaexporter.Source ?? $wpaexporter.FullName)"
+}
+
+# Add WPT folder to PATH for the current session if needed
+if ($env:PATH -notlike "*Windows Performance Toolkit*") {
+    $env:PATH = "$wptRoot;$env:PATH"
+}
+```
+
+Only proceed to Step 1 after all three tools (`py`/`python`/`python3`, `symcachegen.exe`, `wpaexporter.exe`) are confirmed present.
+
 ### Step 1: Validate Inputs and Derive `modules_dir`
 
 Verify each path exists before proceeding:
@@ -297,7 +369,8 @@ After writing the file, **report the absolute path** of the generated report to 
 | Tool exits non-zero | Print full stderr verbatim. Stop. |
 | 0 hotspots matched to source | Stop with: "No application functions matched in the source tree. Verify that the PDB and source were built from the same commit." |
 | Callee not found in `<source_dir>` | Note it as `[system/external]` in the dependency map and skip optimizing it. Do not stop. |
-| `py -3` / `python` / `python3` all missing | Stop with: "Python interpreter not found. Install Python 3 and ensure it is on PATH." |
+| `py -3` / `python` / `python3` all missing | Attempt auto-install via `winget install Python.Python.3`. If install succeeds, continue. If it fails, stop with: "Python 3 installation failed. Install manually and ensure it is on PATH." |
+| `symcachegen.exe` or `wpaexporter.exe` missing | Attempt auto-install via `winget install Microsoft.WindowsADK`. If install succeeds, continue. If it fails, stop with: "Windows ADK installation failed. Install manually and ensure the Windows Performance Toolkit feature is selected." |
 | `hotspot_analysis.py` not found | Stop with the two candidate paths that were checked, and ask the user to provide the correct path. |
 | Hotspot cannot be improved by any technique | Do not force a rewrite; record `no-applicable-optimization` and continue to the next worklist item. |
 | Vectorization pass skipped without documented serial dependency | **Blocking error.** Go back, document the dependency in a source comment, record `vectorization-not-applicable: <reason>` in the report, then continue. Silently omitting the vectorization pass is not allowed. |
