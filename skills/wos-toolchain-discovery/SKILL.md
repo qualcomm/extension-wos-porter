@@ -27,6 +27,11 @@ If any variable is empty after the cache read, run the slow path below.
 
 ```powershell
 $hostArch = $env:PROCESSOR_ARCHITECTURE   # AMD64 or ARM64
+# Correct for x64-emulated shells on Windows ARM64 (Git Bash, cmd under WoW64)
+if ($hostArch -eq 'AMD64') {
+    $wmiArch = (Get-WmiObject Win32_Processor | Select-Object -First 1).Architecture
+    if ($wmiArch -eq 12) { $hostArch = 'ARM64' }
+}
 if ($hostArch -eq 'ARM64') {
     $hostDir = 'HostARM64\ARM64'; $vcvars = 'vcvarsarm64.bat';        $dumpbinHost = 'HostARM64\ARM64'
 } else {
@@ -74,6 +79,13 @@ Write-Host "vcvars:   $vcvarsPath"
 # Persist for reuse across phases / sub-agents
 $stateDir  = Join-Path $repoPath '.copilot\state'
 New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
+# Ensure the agent's scratch state never dirties the working tree (Phase 8 G8 clean-tree gate)
+# nor gets committed. Covers wos-toolchain.json, wos-deps.json, wos-milestones.json,
+# optimizer-deferred.json, and any future .copilot state.
+$gi = Join-Path $repoPath '.gitignore'
+if (-not (Test-Path $gi) -or -not (Select-String -Path $gi -SimpleMatch '.copilot/' -Quiet)) {
+    Add-Content -Path $gi -Value "`n# wos-porter agent scratch state (not part of the port)`n.copilot/"
+}
 [pscustomobject]@{
     hostArch = $hostArch; vsPath = $vsPath
     cl = $cl; msbuild = $msbuild; dumpbin = $dumpbin

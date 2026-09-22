@@ -55,15 +55,19 @@ You are the **Windows ARM64 Build & Validation Agent**. Given a local project pa
 
 Load the [wos-toolchain-discovery](../skills/wos-toolchain-discovery/SKILL.md) skill and run it against the project path. It populates `$hostArch`, `$vsPath`, `$cl`, `$msbuild`, `$dumpbin`, `$vcvars` (cached in `<repo>\.copilot\state\wos-toolchain.json` so subsequent invocations skip the discovery cost). If invoked from `wos-porter`, the cache already exists — just read it.
 
-Also probe optional tools if the build system requires them: `Get-Command cmake, cargo, go, meson, ninja, dotnet -ErrorAction SilentlyContinue`.
+Also probe optional tools if the build system requires them: `Get-Command cmake, cargo, go, meson, ninja, dotnet, bazel -ErrorAction SilentlyContinue`.
 
 If `$cl` / `$msbuild` / `$dumpbin` fail to resolve, report BLOCKING and stop.
+
+**Read the resolved dependency graph if present.** When invoked from `wos-porter`, Phase 4's pre-flight resolver writes `<repo>\.copilot\state\wos-deps.json` — the ARM64-resolved dependency set, any load-time-probe neutralizations (e.g. a stubbed `swiftc.exe` for a Bazel `rules_swift` probe), and any un-resolvable deps. Read it and honor it: apply the recorded neutralizations (env vars, `--repo_env`, stub PATH entries, disabled rules) before building, and trust its ARM64-verified libs rather than re-resolving. If a build error traces to an **external-repo / repository-rule / WORKSPACE-load failure** (Bazel `swift_autoconfiguration`, CUDA/ROCm/Python auto-config, a `fail()` in a `.bzl`), treat it as a **dependency problem** — load the [wos-build-recipes-misc](../instructions/wos-build-recipes-misc.instructions.md) Bazel external-repo section and apply its fixes (don't-load-the-rule / stub-the-probe / `--repo_env` / narrow the target subgraph) — NOT as an ARM64 compile error, and record the fix back into `wos-deps.json`.
 
 ---
 
 ## Phase 3: Build All Targets
 
-**Build using the detected build system. Always build ALL targets including tests and examples.**
+**Build using the detected build system. Always build ALL targets including tests and examples** — EXCEPT when a milestone ladder is present (complex projects; see below).
+
+**Milestone-aware building (complex projects).** If `<repo>\.copilot\state\wos-milestones.json` exists (written by `wos-porter` Phase 2 step 6a), do NOT attempt a monolithic `//...` / all-targets build. Build ONE milestone at a time, lowest first (e.g. the core library target, not the whole repo). Land Milestone 1 clean before climbing. Stop climbing when a milestone hits an un-worked-around `pre-existing-upstream` or `scope-decision` blocker (see triage below) and report the highest milestone reached as the outcome — a clean Milestone 1 is a SUCCESS, not a partial failure.
 
 ### Build commands by system:
 - **MSBuild**: `& $msbuild "<sln>" /t:Build /p:Configuration=Release /p:Platform=ARM64 /m`
@@ -92,6 +96,33 @@ Capture exit code and error output after build.
 ## Phase 4: Fix Build Errors (Self-Healing Loop)
 
 **Run up to 5 fix cycles. Each cycle: identify errors → fix → rebuild → check. Commit after each cycle.**
+
+**Before fixing, triage each error into one of three classes** (record the class in your report — only the first counts against port success):
+| Class | How to tell | Action |
+|---|---|---|
+| **arm64-porting** | ARM64-specific: `_mm_*`/`__m128` undeclared, x86 asm, `_M_X64` guard, `machine type X64 conflicts`, x86-only CRT/unwinder symbols, `/arch:AVX2` on ARM64 | FIX using the recipes below — this is the job |
+| **pre-existing-upstream** | The SAME error reproduces on an x64 build of the same commit, OR it's a known compiler/toolchain regression (e.g. a **protobuf × MSVC 14.5x `<variant>` internal-compiler regression**), OR a dep that fails to build on *any* Windows arch | NOT an ARM64 blocker. For an MSVC-version regression, work down the **toolset-regression ladder** below before ever declaring it blocking. If no ladder rung applies cheaply, DOCUMENT it with the x64-too repro/evidence and move on — do not burn fix cycles fighting it |
+| **scope-decision** | Target is upstream-unsupported on native Windows (desktop examples, Android/iOS-only), or a giant unproven transitive component | DEFER per the milestone ladder; exclude from this milestone's target set. Not a failure |
+
+**Toolset-regression ladder** (when a `pre-existing-upstream` error is an MSVC-version compiler regression). Enumerate what is ACTUALLY installed first — do NOT assume an older toolset exists:
+```powershell
+Get-ChildItem "$vsPath\VC\Tools\MSVC" -Directory | Select-Object -ExpandProperty Name   # list installed toolsets
+```
+Then, in order:
+1. **Use an already-installed compatible toolset.** If the enumeration shows a pre-regression version, build the failing TU/target with it: `call vcvarsall.bat arm64 -vcvars_ver=<that.version>`. (Common on dev boxes with several VS toolsets.)
+2. **Pin the offending dependency to a pre-regression revision** (cheap, environment-independent — prefer this when only one toolset is installed). Set the dep's version/commit in its manifest (vcpkg baseline, Bazel `http_archive` sha/tag, CMake `FetchContent` GIT_TAG, Cargo `=version`) to the last release before the regression. Avoids the compiler bug without touching the toolchain.
+3. **Install a fallback toolset on demand** — ONLY meaningful if a VS installer is present (typically NOT on locked/offline CI). The regressed environment usually has a *single* toolset, so this is a runner-provisioning action, not a `vcvars` flag:
+   ```powershell
+   & "$vsInstaller" modify --installPath "$vsPath" --quiet --norestart `
+     --add Microsoft.VisualStudio.Component.VC.<ver>.x86.x64 `
+     --add Microsoft.VisualStudio.Component.VC.<ver>.ARM64      # ARM64 target components too
+   ```
+   (component IDs from the VS component catalog / `vs_installer`). Then retry with `-vcvars_ver=<ver>`. If the installer is absent or the modify fails, do NOT claim this fallback — fall through to (4).
+4. **Document** as `pre-existing-upstream` with the exact error, the x64-too repro, and which ladder rungs were unavailable.
+
+> **CI-environment note:** GitHub-hosted Windows runners (`windows-2022`/`windows-2025`) ship **exactly one** MSVC toolset (currently 14.5x) — so rung 1 usually has nothing to select and rung 3 needs an explicit `vs_installer` provisioning step (a workflow `run:` line), not just a `vcvars` flag. On a stock CI runner, **rung 2 (pin the dependency) is the reliable path**; treat rung 3 as available only when the workflow has pre-installed the fallback toolset or the installer is reachable.
+
+To check "reproduces on x64 too" cheaply when unsure: attempt the single failing target for `x64` (`/p:Platform=x64`, `--config=windows_x64`, etc.). If it fails identically, it's `pre-existing-upstream`, not your port.
 
 ### Common error patterns and fixes:
 
@@ -195,10 +226,32 @@ Capture exit code and error output after build.
 
 When the error doesn't fit any row above, capture the **first** (not last) error line plus 20 lines of context, search this file for the closest keyword, and apply that recipe with a note. Never silently skip a class of errors — record "unmatched error pattern" in the per-cycle log so reviewers can extend this table.
 
-**Commit each fix cycle:**
+**Commit each fix cycle — stage only ARM64-relevant files:**
 ```powershell
-git add -A
-git commit -m "ARM64 build fix cycle <N>: <description>"
+# Read project style/convention detected in Phase 1
+$styleFile = Join-Path $projectPath '.copilot\state\wos-style.json'
+$commitConvention = if (Test-Path $styleFile) {
+    (Get-Content $styleFile -Raw | ConvertFrom-Json).commitConvention
+} else { 'imperative' }
+
+# Stage only source/build-system files — never build artifacts, IDE files, or lock files
+$toStage = git -C $projectPath diff --name-only | Where-Object {
+    $_ -notmatch '[\\/](obj|bin|Debug|Release|ARM64|x64)[\\/]' -and
+    $_ -notmatch '\.(lock|sum|ilk|pdb|exp|tlog|lastbuildstate|idb|ipch|vc\.db|user)$' -and
+    $_ -notmatch '^\.vs[\\/]'
+}
+if ($toStage) { $toStage | ForEach-Object { git -C $projectPath add $_ } }
+
+# Sanity-check: review staged set before committing
+git -C $projectPath diff --cached --stat
+# If unrelated files appear above, unstage them: git restore --staged <file>
+
+$msg = if ($commitConvention -eq 'conventional') {
+    "build(arm64): fix cycle <N> - <description>"
+} else {
+    "ARM64 build fix cycle <N>: <description>"
+}
+git -C $projectPath commit -m $msg
 ```
 
 Track: `Cycle N: X errors → fixed Y → committed → Z remaining`
@@ -237,7 +290,23 @@ Track: `Cycle N: X errors → fixed Y → committed → Z remaining`
 
 **NOT complete until a patch file exists and its path is reported.**
 
-1. Commit any remaining changes.
+1. Commit any remaining source/build-system changes — use the same targeted filter as the fix-cycle commits (no build artifacts, no IDE files, no benchmark results):
+   ```powershell
+   $styleFile = Join-Path $projectPath '.copilot\state\wos-style.json'
+   $commitConvention = if (Test-Path $styleFile) { (Get-Content $styleFile -Raw | ConvertFrom-Json).commitConvention } else { 'imperative' }
+   $remaining = git -C $projectPath diff --name-only | Where-Object {
+       $_ -notmatch '[\\/](obj|bin|Debug|Release|ARM64|x64)[\\/]' -and
+       $_ -notmatch '\.(lock|sum|ilk|pdb|exp|tlog|lastbuildstate|idb|ipch|vc\.db|user)$' -and
+       $_ -notmatch '^\.vs[\\/]' -and
+       $_ -notmatch '^benchmarks[\\/]'
+   }
+   if ($remaining) {
+       $remaining | ForEach-Object { git -C $projectPath add $_ }
+       git -C $projectPath diff --cached --stat
+       $msg = if ($commitConvention -eq 'conventional') { "build(arm64): final source fixes" } else { "ARM64: final source fixes" }
+       git -C $projectPath commit -m $msg
+   }
+   ```
 2. Show commit log: `git log --oneline $baseCommit..HEAD`
 3. Generate unified patch: `git diff $baseCommit..HEAD > arm64-build-fixes.patch`
 4. Generate per-commit patches: `git format-patch $baseCommit..HEAD -o arm64-patches/`

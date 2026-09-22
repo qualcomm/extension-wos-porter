@@ -100,7 +100,26 @@ The 6 phases:
 
 16. After applying fixes, rerun ONLY the previously failing tests (not the full suite). Re-classify any still-failing tests.
 17. If error count does not decrease after 2 cycles, stop and record remaining failures with full classification for the report.
-18. Commit fixes on the existing branch in batches with descriptive messages: `git add -A; git commit -m "ARM64: <category> fix in <area>"`.
+18. Commit fixes on the existing branch in batches — stage only the files you intentionally edited as test fixes, never all modified files:
+    ```powershell
+    # Read project commit convention
+    $styleFile = Join-Path $projectPath '.copilot\state\wos-style.json'
+    $commitConvention = if (Test-Path $styleFile) {
+        (Get-Content $styleFile -Raw | ConvertFrom-Json).commitConvention
+    } else { 'imperative' }
+
+    # Stage only the specific source files modified as fixes (list them explicitly)
+    $fixedFiles | ForEach-Object { git -C $projectPath add $_ }
+    git -C $projectPath diff --cached --stat   # verify before committing
+    # Unstage anything unexpected: git restore --staged <file>
+
+    $msg = if ($commitConvention -eq 'conventional') {
+        "fix(arm64): <category> fix in <area>"
+    } else {
+        "ARM64: <category> fix in <area>"
+    }
+    git -C $projectPath commit -m $msg
+    ```
 19. Mark Phase 4 completed, Phase 5 in-progress.
 
 ## Phase 5: Benchmarks

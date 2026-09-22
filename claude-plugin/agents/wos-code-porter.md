@@ -23,7 +23,7 @@ You will receive:
 - **Use `#if` / `#elif` guards**: ARM64 code goes in guarded blocks alongside x64 code.
 - **Hand-write `<arm_neon.h>` translations for SIMD**: every NEON instruction must come from a hand-written intrinsic. Do NOT vendor or include `sse2neon.h`, `simde`, `xsimd`, `highway`, or any other SIMD translation/abstraction header — these are forbidden by the porting workflow. The same rule applies to AVX/AVX2/AVX-512: hand-write the NEON equivalents (typically 2× 128-bit NEON ops per 256-bit AVX op).
 - **Provide C fallbacks**: When a clean ARM64 equivalent isn't available, provide a portable C implementation as fallback. A scalar fallback is also acceptable as a temporary placeholder for any SSE kernel not yet hand-ported — it keeps the file linking on ARM64 while `wos-optimizer` (Phase 7) hand-ports the hot kernels later.
-- **Match project style**: Follow existing code conventions for formatting, naming, comments.
+- **Match project style**: Read `<repoPath>\.copilot\state\wos-style.json` (written by `wos-porter` in Phase 1) before editing any file. Honor `indentStyle`/`indentSize` in all new code blocks. If `clangFormatPresent = true`, avoid introducing formatting that will produce noisy diffs under clang-format; prefer the minimal change that makes the code correct.
 - **Comment all additions**: Mark ARM64 code blocks with clear comments.
 
 ## Architecture Detection Macros

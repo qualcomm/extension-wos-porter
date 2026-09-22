@@ -1,6 +1,6 @@
 {
   "name": "wos-porter",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "AI agents that port open-source x64 Windows applications to native ARM64. Analyzes repos, ports build systems and source code, builds, validates binaries with dumpbin, runs tests, and applies hand-written NEON optimizations.",
   "author": {
     "name": "Qualcomm",

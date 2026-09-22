@@ -101,6 +101,31 @@ cc_library(
 
 Build: `bazel build //... --platforms=@platforms//cpu:aarch64`
 
+### Bazel external repositories & load-time toolchain probes (complex monorepos: TensorFlow, gRPC, XLA)
+
+On large projects the build dies **before any target compiles**, during WORKSPACE/MODULE load, when an external `repository_rule` eagerly probes for a toolchain and hard-`fail()`s. Canonical example (TensorFlow-transitive):
+
+```
+ERROR: .../rules_swift/swift/internal/swift_autoconfiguration.bzl:...:
+  No 'swiftc.exe' executable found in Path
+```
+
+This is a **dependency-resolution** problem, not an ARM64 source issue — Swift is irrelevant to a Windows ARM64 TF build, but the repo rule runs regardless. Fixes, in order of preference:
+
+1. **Don't load the unused rule.** In `WORKSPACE`, comment out the `swift_rules_dependencies()` / `register_toolchains("@build_bazel_rules_swift//...")` call (or the `*_configure()` that triggers it) when nothing you build depends on it. For `MODULE.bazel`, drop the `bazel_dep(name = "rules_swift")` or mark it `dev_dependency = True`.
+2. **Satisfy the probe cheaply** when the rule must load. Put a no-op stub on `PATH` so the `which`-style check passes:
+   ```powershell
+   # stub swiftc.exe — a batch that exits 0; the rule only checks existence, never runs a real compile
+   $stub = "$env:TEMP\swiftstub"; New-Item -ItemType Directory -Force $stub | Out-Null
+   Set-Content "$stub\swiftc.bat" "@exit /b 0"   # or a copy of any exe named swiftc.exe
+   $env:PATH = "$stub;$env:PATH"
+   ```
+   Same pattern for other eager probes: set the env var the rule reads (`SWIFT_HOME`, `BAZEL_SH`, `PYTHON_BIN_PATH`, `TF_NEED_CUDA=0`, `TF_NEED_ROCM=0`).
+3. **Steer autodetection with `--repo_env` / `--action_env`** instead of the ambient environment (reproducible, survives `--repo_env` caching): `bazel build --repo_env=TF_NEED_CUDA=0 --repo_env=PYTHON_BIN_PATH=C:/Python-arm64/python.exe ...`.
+4. **Build only the subgraph you need** so unused external repos are never fetched/configured: `bazel build //tensorflow/lite:libtensorflowlite.so` rather than `//...`. Bazel only resolves repos reachable from the requested targets — narrowing the target set is often the fastest way past a toolchain probe for a component you don't ship.
+
+Verify what a target actually pulls in before fighting a probe: `bazel query 'deps(//your:target)' --output package` and `bazel query 'kind("repository_rule", //external:*)'`. If the failing rule is NOT in your target's dep set, option 1 or 4 removes it entirely. NEVER register an x64 toolchain to get past the probe on an ARM64 build.
+
 ## GN (Chromium / V8 / PDFium)
 
 Args: `gn gen out/arm64 --args='target_cpu="arm64" target_os="win"'`

@@ -1,0 +1,327 @@
+name: WoS Port (Windows ARM64, Claude Code)
+
+# A/B counterpart to wos-port-copilot.yml. Same pipeline, same artifacts, same
+# runner — swaps the backend from GitHub Copilot CLI to Anthropic Claude Code.
+# The wos-porter Claude plugin ships in this repo under ./claude-plugin (with
+# its marketplace.json at the repo root), so we load it headlessly with
+# `claude --plugin-dir` — no interactive `/plugin` marketplace/install step.
+#
+# Auth (two supported modes):
+#   1. Direct Anthropic API — set repo secret ANTHROPIC_API_KEY (a Claude API
+#      key). Leave the anthropic_base_url input empty.
+#   2. LiteLLM (or any Anthropic-format LLM gateway) — set the anthropic_base_url
+#      input to your proxy URL and store the gateway credential in the repo
+#      secret LITELLM_API_KEY. LiteLLM authenticates with a Bearer token, so we
+#      pass it as ANTHROPIC_AUTH_TOKEN (Authorization: Bearer). The proxy must
+#      expose the Anthropic Messages API (/v1/messages), and claude_model must
+#      name a route your proxy serves. See:
+#      https://code.claude.com/docs/en/llm-gateway-connect
+#
+# The Claude CLI reads ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN / ANTHROPIC_BASE_URL
+# from the environment in headless (`-p`) mode — no CLI flag needed. See:
+# https://code.claude.com/docs/en/headless
+# https://code.claude.com/docs/en/cli-reference
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo_url:
+        description: "GitHub repository to port (https://github.com/owner/repo or owner/repo)"
+        required: true
+        type: string
+      claude_model:
+        description: "Claude model alias (sonnet, opus, haiku), a full model id, or a LiteLLM route name"
+        required: false
+        type: string
+        default: "sonnet"
+      anthropic_base_url:
+        description: "LLM-gateway base URL (e.g. https://your-litellm-host). Leave empty to use the direct Anthropic API."
+        required: false
+        type: string
+        default: ""
+      max_turns:
+        description: "Max agentic turns before Claude stops (headless --max-turns)"
+        required: false
+        type: string
+        default: "400"
+
+concurrency:
+  group: wos-port-claude-${{ github.event.inputs.repo_url }}
+  cancel-in-progress: false
+
+jobs:
+  port:
+    name: Port ${{ github.event.inputs.repo_url }} to ARM64 (Claude Code)
+    runs-on: windows-11-arm
+    timeout-minutes: 360
+    env:
+      # Direct-API credential (used when anthropic_base_url is empty).
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      # Gateway routing + Bearer credential (used when anthropic_base_url is set).
+      # LiteLLM authenticates via Authorization: Bearer, which the CLI reads from
+      # ANTHROPIC_AUTH_TOKEN. Both are harmless to set unconditionally — the
+      # CLI ignores the ones that don't apply for the active mode.
+      ANTHROPIC_BASE_URL: ${{ github.event.inputs.anthropic_base_url }}
+      ANTHROPIC_AUTH_TOKEN: ${{ secrets.LITELLM_API_KEY }}
+      WOS_REPO_URL: ${{ github.event.inputs.repo_url }}
+      CLAUDE_MODEL: ${{ github.event.inputs.claude_model }}
+      MAX_TURNS: ${{ github.event.inputs.max_turns }}
+    steps:
+      - name: Checkout extension (for the wos-porter Claude plugin)
+        uses: actions/checkout@v4
+
+      - name: Verify auth is configured (direct API or gateway)
+        shell: pwsh
+        run: |
+          if ($env:ANTHROPIC_BASE_URL) {
+            # Gateway mode (e.g. LiteLLM): need a Bearer credential.
+            Write-Host "Auth mode: LLM gateway -> $env:ANTHROPIC_BASE_URL"
+            if (-not $env:ANTHROPIC_AUTH_TOKEN) {
+              Write-Error "anthropic_base_url is set (gateway mode) but the LITELLM_API_KEY secret is empty. Store your LiteLLM/gateway Bearer credential as a repo secret named LITELLM_API_KEY."
+              exit 1
+            }
+            Write-Host "ANTHROPIC_AUTH_TOKEN present (length=$($env:ANTHROPIC_AUTH_TOKEN.Length)); ANTHROPIC_BASE_URL set."
+            # Avoid an auth-source conflict: in gateway mode the Bearer token is
+            # the credential, so drop any direct-API key that may also be set.
+            "ANTHROPIC_API_KEY=" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          } else {
+            # Direct Anthropic API mode.
+            Write-Host "Auth mode: direct Anthropic API"
+            if (-not $env:ANTHROPIC_API_KEY) {
+              Write-Error "No ANTHROPIC_BASE_URL was provided (direct-API mode) and the ANTHROPIC_API_KEY secret is empty. Either set ANTHROPIC_API_KEY, or provide anthropic_base_url + LITELLM_API_KEY for gateway mode."
+              exit 1
+            }
+            Write-Host "ANTHROPIC_API_KEY present (length=$($env:ANTHROPIC_API_KEY.Length))"
+            # Avoid an auth-source conflict: with no gateway, drop the unused Bearer token.
+            "ANTHROPIC_AUTH_TOKEN=" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          }
+
+      - name: Set up Node.js (for Claude CLI + npm-based build systems)
+        uses: actions/setup-node@v7
+        with:
+          node-version: 20
+
+      - name: Install Claude Code CLI
+        shell: pwsh
+        run: |
+          npm install -g @anthropic-ai/claude-code
+          claude --version
+
+      - name: Show preinstalled ARM64 toolchain
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) {
+            $vswhere = "$env:ProgramFiles\Microsoft Visual Studio\Installer\vswhere.exe"
+          }
+          $vsPath = & $vswhere -latest -property installationPath
+          Write-Host "VS install: $vsPath"
+          $cl = Get-ChildItem "$vsPath\VC\Tools\MSVC" -Recurse -Filter cl.exe |
+                Where-Object { $_.FullName -match 'HostARM64\\ARM64' } |
+                Select-Object -First 1 -ExpandProperty FullName
+          if (-not $cl) {
+            $cl = Get-ChildItem "$vsPath\VC\Tools\MSVC" -Recurse -Filter cl.exe |
+                  Where-Object { $_.FullName -match 'Hostx64\\arm64' } |
+                  Select-Object -First 1 -ExpandProperty FullName
+          }
+          Write-Host "ARM64-target cl.exe: $cl"
+          Get-Command cmake, ninja, git, python -ErrorAction SilentlyContinue |
+            Format-Table Name, Source
+
+      - name: Prepare work directory + resolve plugin path
+        id: prep
+        shell: pwsh
+        run: |
+          $workRoot = "C:\src\wos-porter"
+          New-Item -ItemType Directory -Force -Path $workRoot | Out-Null
+
+          # The wos-porter Claude plugin lives at <checkout>/claude-plugin
+          # (its .claude-plugin/plugin.json is what `--plugin-dir` looks for).
+          # Loading it this way exposes the /wos-porter:wos-porter command and
+          # all seven wos-* subagents to the headless run — no marketplace add
+          # or `/plugin install` needed.
+          $pluginDir = Join-Path $env:GITHUB_WORKSPACE "claude-plugin"
+          $manifest  = Join-Path $pluginDir ".claude-plugin\plugin.json"
+          if (-not (Test-Path $manifest)) {
+            Write-Error "Plugin manifest not found at $manifest — is claude-plugin/ present in the checkout?"
+            exit 1
+          }
+          Write-Host "Plugin dir: $pluginDir"
+          "plugin_dir=$pluginDir" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Run wos-porter headless (Claude Code)
+        working-directory: C:\src\wos-porter
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $logDir = "C:\src\wos-porter\_logs"
+          New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+
+          # -p (print mode): non-interactive, runs to completion and exits —
+          #    the headless analog of Copilot CLI's `copilot -p`.
+          # --plugin-dir: load the local wos-porter plugin for this session,
+          #    making the /wos-porter:wos-porter command available. That
+          #    command reads the wos-porter agent's 8-phase pipeline and spawns
+          #    the six wos-* sub-agents itself (it runs in the main loop
+          #    because sub-agents can't spawn further sub-agents).
+          # --dangerously-skip-permissions: bypass all permission prompts,
+          #    required for headless CI (equivalent to
+          #    --permission-mode bypassPermissions). The runner is single-use
+          #    and ephemeral, so the blast radius is bounded.
+          # --max-turns: cap agentic turns; analog of Copilot's
+          #    --max-autopilot-continues.
+          # --output-format stream-json + --verbose: emit JSONL (one object per
+          #    line) for a full, inspectable trace of the run.
+          #
+          # The prompt is the plugin's own slash command with the repo URL as
+          # its argument — the command carries all the orchestration logic.
+          $prompt = "/wos-porter:wos-porter $env:WOS_REPO_URL"
+
+          Write-Host "Prompt: $prompt"
+          Write-Host "Model:  $env:CLAUDE_MODEL"
+          if ($env:ANTHROPIC_BASE_URL) { Write-Host "Gateway: $env:ANTHROPIC_BASE_URL" } else { Write-Host "Gateway: (none — direct Anthropic API)" }
+          Write-Host "Plugin: ${{ steps.prep.outputs.plugin_dir }}"
+
+          claude `
+            -p $prompt `
+            --plugin-dir "${{ steps.prep.outputs.plugin_dir }}" `
+            --model $env:CLAUDE_MODEL `
+            --max-turns ([int]$env:MAX_TURNS) `
+            --dangerously-skip-permissions `
+            --output-format stream-json `
+            --verbose `
+            2>&1 |
+            Tee-Object -FilePath (Join-Path $logDir "claude-run.jsonl")
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "claude exited with code $LASTEXITCODE — artifacts will still be uploaded for inspection."
+          }
+
+      - name: Locate ported repo
+        id: locate
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $portedRoot = "C:\src\wos-porter"
+          if (-not (Test-Path $portedRoot)) {
+            Write-Warning "$portedRoot does not exist — the porter step never ran or failed before cloning."
+            "ported_repo=" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            exit 0
+          }
+          $candidates = Get-ChildItem -Directory $portedRoot -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -ne '_logs' -and (Test-Path (Join-Path $_.FullName '.git')) }
+          if (-not $candidates) {
+            Write-Warning "No cloned repo found under $portedRoot — porter never got past Phase 1."
+            "ported_repo=" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            exit 0
+          }
+          $ported = $candidates | Select-Object -First 1
+          Write-Host "Ported repo: $($ported.FullName)"
+          "ported_repo=$($ported.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "ported_name=$($ported.Name)"     | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Generate arm64-port patch + summary
+        if: always() && steps.locate.outputs.ported_repo != ''
+        working-directory: ${{ steps.locate.outputs.ported_repo }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $outDir = "C:\src\wos-porter\_artifacts"
+          $seriesDir = Join-Path $outDir "patches"
+          New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+
+          # The porter does all its work on the 'arm64-port' branch, forked from
+          # the repo's default branch. Confirm that branch exists first.
+          $port = 'arm64-port'
+          $portSha = (git rev-parse --verify --quiet "refs/heads/$port")
+          if (-not $portSha) {
+            Write-Warning "Branch '$port' not found — the porter never created it (likely failed before/at Phase 1). Capturing a working-tree diff instead so there's still something to inspect."
+            git status | Tee-Object (Join-Path $outDir "git-status.txt") | Out-Null
+            git diff --binary HEAD | Out-File -Encoding ascii (Join-Path $outDir "working-tree.diff")
+            exit 0
+          }
+
+          # Resolve the BASE ref the port forked from. Must never be the port
+          # branch itself (that yields an empty patch — the classic bug). Try the
+          # usual defaults and the remote HEAD, excluding arm64-port.
+          $base = $null
+          foreach ($cand in @('main','master','origin/main','origin/master','origin/HEAD')) {
+            if ($cand -eq $port) { continue }
+            $sha = (git rev-parse --verify --quiet $cand)
+            if ($sha) { $base = $cand; break }
+          }
+          if (-not $base) {
+            Write-Warning "Could not resolve a base branch (main/master/origin). Falling back to the parent of the first arm64-port commit."
+            $base = (git rev-list --max-parents=0 "$port" | Select-Object -Last 1)  # root commit
+          }
+
+          # Use the true fork point so the patch contains ONLY the porter's work,
+          # not unrelated commits that landed on the base after the fork.
+          $forkPoint = (git merge-base $base $port).Trim()
+          if (-not $forkPoint) { $forkPoint = $base }
+          Write-Host "Base ref: $base   fork point: $forkPoint   port tip: $portSha"
+
+          $range = "$forkPoint..$port"
+          $commitCount = [int](git rev-list --count $range)
+          Write-Host "Commits on $port since fork: $commitCount"
+
+          git log --oneline $range | Tee-Object (Join-Path $outDir "commits.txt")
+          git diff --stat $range   | Tee-Object (Join-Path $outDir "diffstat.txt")
+
+          if ($commitCount -eq 0) {
+            Write-Warning "No commits on '$port' beyond the base — nothing to turn into a patch. The porter may have applied changes but never committed them; capturing the working-tree diff as a fallback."
+            git diff --binary $range | Out-File -Encoding ascii (Join-Path $outDir "arm64-port.diff")
+            git diff --binary HEAD   | Out-File -Encoding ascii (Join-Path $outDir "working-tree.diff")
+          } else {
+            # Two artifacts: a single combined diff (git apply) and the per-commit
+            # mbox series (git am). Write the combined patch with .NET so PS 5.1
+            # doesn't inject a UTF-8 BOM that breaks `git apply`.
+            $combined = Join-Path $outDir "arm64-port.patch"
+            $diffText = (git diff --binary $range | Out-String)
+            [System.IO.File]::WriteAllText($combined, $diffText, (New-Object System.Text.UTF8Encoding($false)))
+            Write-Host "Wrote combined patch: $combined"
+
+            New-Item -ItemType Directory -Force -Path $seriesDir | Out-Null
+            $series = git format-patch $range -o $seriesDir
+            Write-Host "Wrote $($series.Count) per-commit patch file(s) to $seriesDir"
+          }
+
+          if (Test-Path "ARM64-PORT.md") {
+            Copy-Item "ARM64-PORT.md" (Join-Path $outDir "ARM64-PORT.md") -Force
+          } else {
+            Write-Warning "ARM64-PORT.md was not produced — Phase 8 did not complete."
+          }
+
+      - name: Upload run log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: claude-run-log
+          path: C:\src\wos-porter\_logs\**
+          if-no-files-found: warn
+
+      - name: Upload ARM64 port artifacts (patch + report)
+        if: always() && steps.locate.outputs.ported_repo != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: arm64-port-claude-${{ steps.locate.outputs.ported_name }}
+          path: C:\src\wos-porter\_artifacts\**
+          if-no-files-found: warn
+
+      - name: Upload full ported working tree (branch arm64-port)
+        if: always() && steps.locate.outputs.ported_repo != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: ported-repo-claude-${{ steps.locate.outputs.ported_name }}
+          path: |
+            ${{ steps.locate.outputs.ported_repo }}/**
+            !${{ steps.locate.outputs.ported_repo }}/**/node_modules/**
+            !${{ steps.locate.outputs.ported_repo }}/**/target/**
+            !${{ steps.locate.outputs.ported_repo }}/**/build/**
+            !${{ steps.locate.outputs.ported_repo }}/**/build-arm64/**
+            !${{ steps.locate.outputs.ported_repo }}/**/out/**
+            !${{ steps.locate.outputs.ported_repo }}/**/x64/**
+            !${{ steps.locate.outputs.ported_repo }}/**/Debug/**
+            !${{ steps.locate.outputs.ported_repo }}/**/Release/**
+          if-no-files-found: warn

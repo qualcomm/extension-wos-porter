@@ -26,7 +26,45 @@ The target is always Windows ARM64; the host may be x64 (cross-compile) or ARM64
 
 There are three ways to install, depending on where the plugin lives. Pick one.
 
-### Option A — Install from GitHub (recommended)
+### Option A — Interactive menu (recommended)
+
+https://github.com/user-attachments/assets/068e688f-3d6f-4fdf-a4e8-d026dce2ed82
+
+
+**Using the VS Code UI**
+If you prefer using the UI instead of typing commands, install the Claude Code extension for Visual Studio Code, then open a new session and run:
+
+```
+/plugin
+```
+
+Then choose **Manage marketplaces → Add marketplace**, enter `qualcomm/extension-wos-porter` (or a local path), and install **wos-porter** from the browse list.
+
+
+### Option B — Install from a local clone
+
+Use this while developing, or when you have the repo checked out locally.
+
+1. Clone (or use your existing checkout):
+
+   ```
+   git clone https://github.com/qualcomm/extension-wos-porter.git
+   ```
+
+2. In Claude Code, add the local checkout as a marketplace (point at the repo root that contains `.claude-plugin/marketplace.json`):
+
+   ```
+   /plugin marketplace add C:\path\to\extension-wos-porter
+   ```
+
+3. Install:
+
+   ```
+   /plugin install wos-porter@extension-wos-porter
+   ```
+
+### Option C — Install from GitHub
+
 
 This works once the repo (including the root `.claude-plugin/marketplace.json` and this `claude-plugin/` folder) is pushed to GitHub.
 
@@ -64,42 +102,54 @@ To update later, refresh the marketplace and reinstall:
 /plugin install wos-porter@extension-wos-porter
 ```
 
-### Option B — Install from a local clone
+## Using with Codex CLI
 
-Use this while developing, or when you have the repo checked out locally.
+The same plugin works in **OpenAI Codex CLI** — the `.claude-plugin/marketplace.json` and `claude-plugin/` directory are already in the Codex plugin format.
 
-1. Clone (or use your existing checkout):
+### Install
 
-   ```
-   git clone https://github.com/qualcomm/extension-wos-porter.git
-   ```
-
-2. In Claude Code, add the local checkout as a marketplace (point at the repo root that contains `.claude-plugin/marketplace.json`):
+1. Add the repo as a Codex marketplace (run once, from any directory):
 
    ```
-   /plugin marketplace add C:\path\to\extension-wos-porter
+   codex plugin marketplace add C:\path\to\extension-wos-porter
    ```
 
-3. Install:
+   Or from GitHub (once the repo is public):
 
    ```
-   /plugin install wos-porter@extension-wos-porter
+   codex plugin marketplace add qualcomm/extension-wos-porter
    ```
 
-### Option C — Interactive menu
+2. Install the plugin:
 
+   ```
+   codex plugin add wos-porter@extension-wos-porter
+   ```
 
-https://github.com/user-attachments/assets/068e688f-3d6f-4fdf-a4e8-d026dce2ed82
-
-
-
-If you prefer the UI instead of typing commands, run:
+### Use
 
 ```
-/plugin
+@wos-porter https://github.com/owner/repo
 ```
 
-Then choose **Manage marketplaces → Add marketplace**, enter `qualcomm/extension-wos-porter` (or a local path), and install **wos-porter** from the browse list.
+Optional flags work exactly as in Claude Code — pass inline in your message:
+
+```
+# Skip NEON optimization:
+@wos-porter https://github.com/owner/repo WOS_SKIP_OPTIMIZE=1
+
+# x64 baseline for gap-targeted optimization:
+@wos-porter https://github.com/owner/repo C:\x64_bench\bench_results.json
+```
+
+### Update
+
+```
+codex plugin marketplace update extension-wos-porter
+codex plugin add wos-porter@extension-wos-porter
+```
+
+---
 
 ## Usage
 

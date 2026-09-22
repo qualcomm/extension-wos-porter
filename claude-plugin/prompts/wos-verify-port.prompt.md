@@ -96,16 +96,23 @@ if (-not $benchFile -and $hostArch -eq 'ARM64' -and $testerReport -notmatch 'No 
 
 ### G7 — optimizer commits match claimed counts
 ```powershell
+# Phase 7 runs ONE of two optimizers: wos-optimizer (default) OR wos-benchmark-optimizer (differential, when an x64 benchmark was supplied).
+# Both commit with a 'NEON' message prefix — wos-optimizer uses 'NEON:', wos-benchmark-optimizer uses 'NEON(gap):' — so one --grep '^NEON' matches both.
 if ($optimizerReport -match 'Functions optimized.*?Tier A.*?(\d+)') { $claimedA = [int]$Matches[1] }
 elseif ($optimizerReport -match 'Functions optimized\s*[:\|].*?(\d+)') { $claimedA = [int]$Matches[1] }
 else { $claimedA = 0 }
 if ($optimizerReport -match 'Tier-S translations.*?(\d+)\s*(?:file|entr)') { $claimedS = [int]$Matches[1] } else { $claimedS = 0 }
 $claimed = $claimedA + $claimedS
-$neonCommits = (git log --oneline main..arm64-port --grep '^NEON:' 2>$null | Measure-Object).Count
+$neonCommits = (git log --oneline main..arm64-port --grep '^NEON' 2>$null | Measure-Object).Count
+# Terminal skip/no-op outcomes that are valid for EITHER optimizer (differential agent uses the phrasings from its "When NOT to optimize" list).
+$validNoop = 'No high-confidence|Skipped|No x64 benchmark supplied|No Matched benchmark pairs|at-parity or ARM64-ahead|Partial —'
 if ($claimed -gt 0 -and $neonCommits -lt $claimed) {
-    $gateFailures += "G7: optimizer claimed $claimed (A=$claimedA, S=$claimedS) but only $neonCommits 'NEON:' commits"
-} elseif ($claimed -eq 0 -and $optimizerReport -notmatch 'No high-confidence|Skipped') {
-    $gateFailures += 'G7: optimizer report neither claims optimizations nor explicitly skips'
+    $gateFailures += "G7: optimizer claimed $claimed (A=$claimedA, S=$claimedS) but only $neonCommits 'NEON'-prefixed commits"
+} elseif ($claimed -eq 0 -and $neonCommits -eq 0 -and $optimizerReport -notmatch $validNoop) {
+    # Only a failure when there is NEITHER a parsed claim count, NOR any NEON-prefixed commit, NOR a valid no-op outcome.
+    # wos-benchmark-optimizer's "Functions optimized" table has no leading count for the regex to capture, so a successful
+    # differential run yields $claimed=0 but $neonCommits>0 — that must NOT be flagged; the commits prove work landed.
+    $gateFailures += 'G7: optimizer report neither claims optimizations, lands any NEON commit, nor explicitly skips'
 }
 ```
 

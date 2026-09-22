@@ -96,7 +96,12 @@ If the project mixes languages, optimize each in its native idiom — never call
         -Pattern 'for\s*\([^)]*<[^)]*\+\+' | Select-Object -First 200
       ```
 
-4. **Build the ranked candidate list** — surface and process ALL Tier-S and Tier-A candidates (no upper cap). Score each by: `(self-time% from profiler OR slowness-rank from benchmark) × confidence × applicability`, then sort descending. Drop anything in the SKIP set. The list drives both the Tier-S pass (Step 2.0) and the Tier-A per-function loop (Step 2.1–2.10), re-scanned in Step 2.11 until convergence.
+3a. **Resume from prior runs (deferred-work ingestion) — BEFORE the fresh scan.** A previous invocation may have deferred fixable kernels when budget ran out. Reload them from BOTH sources so this run continues automatically:
+   - **JSON ledger** — `<repo>\.copilot\state\optimizer-deferred.json` (Step 2.11). Merge every entry.
+   - **`ARM64-PORT.md` report** — parse its "ARM64 vs x64 Performance Comparison" → "Functions still lagging vs x64" table (or, if this project had no x64 reference, the "NEON Optimizations" deferred list) and re-queue every row/entry flagged **`deferred: budget exhausted`**. Recover `{ file, symbol }` from the row; if only a benchmark/algorithm name is given, re-map via the Step 1.3(a) symbol→benchmark map. Do **NOT** re-queue rows classified `no-ISA-path (both scalar)` / `width-limited SIMD` / `hardware-throughput` / `optional-ISA-unavailable` — those are genuine residuals, re-attempting them wastes budget.
+   - Union the two sources, de-dupe by `file + symbol`, and drop any candidate already committed on the branch (present in `git log` — see the resume cost-reclaim note in Step 2.11). These reloaded candidates enter the list ahead of the fresh scan.
+
+4. **Build the ranked candidate list** — surface and process ALL Tier-S and Tier-A candidates (no upper cap), INCLUDING the resumed candidates from Step 3a. Score each by: `(self-time% from profiler OR slowness-rank from benchmark) × confidence × applicability ÷ estimated-port-cost` (cheap high-gain first — see Budget-aware ordering in Step 2.11), then sort descending. Drop anything in the SKIP set. The list drives both the Tier-S pass (Step 2.0) and the Tier-A per-function loop (Step 2.1–2.10), re-scanned in Step 2.11 until convergence.
 
    **Tier S — full-TU x86-hardware-extension → NEON/ACLE hand-port via `<arm_neon.h>` + `<arm_acle.h>` (highest priority when present)**: an entire translation unit dominated by x86 hardware-extension intrinsics that, on ARM64, currently (a) is excluded from the build and the project falls back to a scalar path in a sibling file, OR (b) is `#if`'d out so the symbol it provides resolves to a slow generic implementation. **You MUST enumerate every such file in the repo and add every one to the candidate list — do not sample, do not stop at the first few, do not pick "representative" files.** Detect with:
    ```powershell
@@ -159,7 +164,7 @@ If the project mixes languages, optimize each in its native idiom — never call
 
 ### Step 2: Apply NEON intrinsics — Tier S full-TU pass, then per-function Tier A, then re-scan (~60% of budget)
 
-Process EVERY Tier-S candidate first (Step 2.0), then every Tier-A candidate via the per-function loop (Steps 2.1–2.10), then iterate the whole pipeline (Step 2.11) until a re-scan surfaces no new candidates or the wall-clock budget is hit. There is no artificial function cap. If any individual step fails for a candidate, REVERT that one change (`git checkout -- <file>`) and move to the next candidate. Never spend more than one attempt per candidate per round.
+Process EVERY Tier-S candidate first (Step 2.0), then every Tier-A candidate via the per-function loop (Steps 2.1–2.10), then iterate the whole pipeline (Step 2.11) until a re-scan surfaces no new candidates or the wall-clock budget is hit. There is no artificial function cap. If any individual step fails for a candidate, REVERT that one change (`git checkout -- <file>`) and move to the next candidate — EXCEPT a benchmark-gate "slower than scalar" result, which must first go through the Step 2.9c diagnose-and-retry (one retry per candidate per round) before it is abandoned.
 
 **2.0 Tier-S: full-TU SSE→NEON hand-port via `<arm_neon.h>`.**
 
@@ -227,7 +232,7 @@ For each Tier-S file identified in Step 1.3/1.4, port it kernel-by-kernel using 
 
   i. **Per-file Tier-S summary** in the report: original SSE/AES-NI/SHA-NI/CLMUL/CRC intrinsic count, total kernels in file, kernels ported and KEPT, kernels reverted by benchmark gate (with measured numbers), kernels deferred (with reason), per-kept-kernel commit hashes.
 
-  j. **Tier-S follow-up profiling**: after the first batch of kernels is in the build, the per-function profiler signal in subsequent Step-2.11 re-scans will re-rank what's still hot. Kernels deferred for "budget-exhausted" automatically resurface in the next outer round; kernels reverted for "NEON slower than scalar" or "test-failed" are reported but NOT auto-retried (a human needs to look at why).
+  j. **Tier-S follow-up profiling**: after the first batch of kernels is in the build, the per-function profiler signal in subsequent Step-2.11 re-scans will re-rank what's still hot. Kernels deferred for "budget-exhausted" automatically resurface in the next outer round. A kernel reverted for "NEON slower than scalar" MUST first go through the diagnose-and-retry step (2.9c) — a slower-than-scalar first draft is usually memory-bound, not a dead end — and is only reported as a final revert (not auto-retried again) after that retry also fails; "test-failed" kernels are reported but NOT auto-retried (a correctness bug needs a human).
 
 **2.1 Read context.** Read the full function plus 30 lines of surrounding context (callers' assumptions, the type definitions, any nearby alignment annotations).
 
@@ -374,6 +379,8 @@ At least ONE NEON / crypto-ext / CRC mnemonic must appear in the relevant functi
 
 **2.9b Per-candidate benchmark gate (NEON vs. scalar baseline) — MANDATORY when host=ARM64 and a baseline exists.** This is the central correctness-of-perf check: an optimization is only kept if it is actually faster than the scalar code it replaced. Skip this step (and keep the NEON kernel tentatively, flagged in the report) ONLY when host=AMD64 or no baseline file is present.
 
+  **Gate-mode selection (decide ONCE in Step 1 — the gate is the largest budget consumer).** If the benchmark CLI can filter to a single algorithm (Google Benchmark/Criterion/BenchmarkDotNet), use per-kernel mode. If it runs the WHOLE suite per invocation with no per-algorithm filter (e.g. cryptopp `cryptest.exe b`), use the **batched fallback (Step 2.9b-e2) as the DEFAULT** — gating per kernel would rerun the entire suite ×3 after every kernel and is the primary cause of "budget exhausted". Use the SHORTENED benchmark duration for all interim gates; reserve a full-duration run for the Step 3 final aggregate only.
+
   a. **Map the kernel to its benchmark(s).** Reuse the symbol→benchmark map built in Step 1.3(a). One kernel may map to 0, 1, or many benchmarks:
      - 1+ mapped benchmarks → use those.
      - 0 mapped benchmarks but the kernel is part of a Tier-S file whose name matches a benchmark group (e.g. `sha_simd.cpp` ↔ `SHA-1/SHA-256` benchmark group) → use that group.
@@ -393,8 +400,17 @@ At least ONE NEON / crypto-ext / CRC mnemonic must appear in the relevant functi
      - Normalize sign so `delta = (scalar_baseline - neon_median) / scalar_baseline` is positive when NEON is faster (regardless of whether the metric is time or throughput).
      - `delta ≥ +0.02` (NEON is ≥2% faster) → **KEEP**. Proceed to Step 2.10 commit.
      - `−0.02 < delta < +0.02` (within noise) → **KEEP** (NEON not measurably slower; record "neutral" in the report). Proceed to Step 2.10.
-     - `delta ≤ −0.02` (NEON is ≥2% slower than scalar) → **REVERT**: `git checkout -- <files-touched>` and `git clean -fd <new-files-from-this-kernel>`. Record the kernel in the report's "Reverted: scalar faster than NEON" table with the measured numbers. Rebuild incrementally to restore the scalar binary, then move to the next candidate. Do NOT retry the same kernel in later rounds.
+     - `delta ≤ −0.02` (NEON is ≥2% slower than scalar) → **go to Step 2.9c (diagnose-and-retry)** before any revert. A first NEON draft that is slower than scalar is usually memory-bound (compiler-inserted reloads from presumed aliasing), not a fundamentally losing port. Only after the 2.9c retry also fails do you `git checkout -- <files-touched>` / `git clean -fd <new-files>`, record the kernel in "Reverted: scalar faster than NEON" WITH the diagnosis and both attempts' numbers, rebuild incrementally, and move on.
      - **Inconclusive** (std-dev across the 3 runs > 5% of the median, or 3-run min/max spread > 15%) → re-run 3 more times (up to 6 total) and recompute the median. If still inconclusive, KEEP with a "high-variance; gate inconclusive" note in the report.
+
+  d2. **Step 2.9c — Diagnose-and-retry (mandatory before abandoning a correct-but-slow kernel; ONE retry per kernel per round).** The kernel builds, passes the diff harness, and emits NEON, but measured at-parity-or-slower than scalar. Do not re-run the same code — disassemble and change strategy:
+     1. `& $dumpbin /disasm <obj_or_lib>` on the hot function; count memory ops (`ldr q`/`str q`) vs arithmetic in the inner loop.
+     2. Match the failure mode to a fix:
+        - **Memory-bound** (loads/stores dominate, or the working state is reloaded every iteration because MSVC-ARM64 can't prove non-aliasing) → **rewrite register-resident**: hoist the working set into named `uintNxM_t` locals held across the whole loop, touch memory only at entry/exit. *(Real example: an LSH-256 literal port measured 138 MiB/s < 233 scalar; the register-resident rewrite of the same intrinsics hit 739 MiB/s.)*
+        - **Rotate/permute-bound** (`shl`+`ushr`+`orr` chains, `vext` split-register sequences) → single-instruction forms: `vsriq_n_*`, `vrev32/64`, `vqtbl1q_u8`.
+        - **Under-parallel** (processes 1 block but independent lanes exist) → widen to 2–4 blocks/iteration to fill latency.
+        - **Spill-bound** (> 32 live q-registers) → reduce live state or split the loop.
+     3. Re-run Steps 2.7–2.9b on the retried version. Pass → KEEP. Fail / no concrete hypothesis → REVERT per the 2.9b(d) slow branch, recording the diagnosis + both attempts. This kernel is NOT auto-retried again in later rounds (the ledger records it), so the next invocation doesn't repeat a known dead end.
 
   e. **Tier-S file scaffolding commits** (Step 2.0(c) scalar fallback) are exempt from this gate — they don't introduce NEON, just allow the file to link. They are kept unconditionally; the per-kernel commits inside them are individually gated.
 
@@ -417,7 +433,11 @@ After completing Tier S (2.0) and the Tier-A per-function pass (2.1–2.10) for 
   - Tier-S files freshly added to the ARM64 build appear as new hand-port targets for their hottest kernels.
   - Symbols that newly link into ARM64 binaries (because a previously-excluded SSE TU is now built) become valid Tier-A candidates.
 
-If the new ranked list contains ANY Tier-S or Tier-A candidate not already processed (by file path + function name), run another full Step-2.0/2.1–2.10 round on the new candidates only. Repeat up to **3 outer rounds total**, OR until a round produces zero new optimizations, OR until the per-invocation wall-clock budget (Hard Constraints) is hit — whichever comes first. Record in the report how many rounds ran and why the loop terminated (`converged: zero new candidates` / `budget exhausted after N rounds` / `round cap hit`).
+If the new ranked list contains ANY Tier-S or Tier-A candidate not already processed (by file path + function name), run another full Step-2.0/2.1–2.10 round on the new candidates only. Keep iterating until a round produces zero new candidates AND leaves zero un-attempted candidates, OR the per-invocation wall-clock budget (Hard Constraints) is hit, OR the outer-round cap is reached — default **5**, overridable via the `WOS_OPTIMIZER_ROUNDS` env var. Do NOT stop at a fixed round count while un-attempted candidates remain and budget is left — the goal is to converge the whole candidate list in ONE invocation, not defer fixable kernels to a human re-invocation. Record in the report how many rounds ran and why the loop terminated (`converged: zero new candidates` / `budget exhausted after N rounds` / `round cap hit`).
+
+Whenever budget forces deferral of an un-attempted or partially-attempted candidate, append it to `<repo>\.copilot\state\optimizer-deferred.json` (`{ file, symbol, tier, rank, last_attempt_result }`); at the start of every invocation, read this file and merge its entries into the candidate list ahead of a fresh scan, and remove an entry once its candidate is kept or hard-skipped with a VALID reason. This lets a follow-up run resume the deferred work automatically instead of requiring a human to re-list each kernel.
+
+**Budget-aware ordering + resume cost-reclaim.** Within a round, process candidates by descending **`impact ÷ estimated-port-cost`**, not impact alone — a guard/dispatch fix that lights up an existing kernel (huge gain, near-zero cost) before a from-scratch full-TU hand-port (big gain, high cost) before micro-tuning. This banks the biggest wins first, so if budget runs out the deferred remainder is the expensive/lower-gain work. On a RESUME run, do NOT re-benchmark or re-attempt candidates already committed on the branch (trust the committed benchmark file + git log); spend fresh budget only on ledger entries + newly-surfaced candidates, so each invocation makes forward progress instead of re-paying the gate cost.
 
 A pure Tier-A invocation on a project with no SSE TUs may converge in one round; a project with multiple `*_sse.cpp` files typically takes 2 rounds (round 1 = Tier S + obvious Tier A; round 2 = hand-tuned hot kernels exposed inside the freshly-vectorized files).
 
@@ -470,7 +490,7 @@ For each row matching a forbidden pattern:
   3. Run another Step-2.0 (Tier S) or Step-2.1–2.10 (Tier A) round on it, attempting a baseline-NEON hand-port. The per-kernel benchmark gate (Step 2.9b) is the ONLY thing allowed to skip it now.
   4. After the new attempt, the row in the skip table must use one of the VALID skip reasons listed in Hard Constraints, with concrete evidence (build error line, test name, measured numbers, vendored-path citation, or named-sibling-file with perf number).
 
-This self-audit pass does NOT count against the "max 3 outer rounds" cap in 2.11 — it is a correctness check on the report, not exploratory work. If the audit forces 5 more candidates back into the queue and that exhausts budget, the resulting rows must say `budget exhausted: deferred to next invocation after kernels <X>, <Y>, <Z>` and name kernels that were actually committed in this invocation.
+This self-audit pass does NOT count against the outer-round cap in 2.11 — it is a correctness check on the report, not exploratory work. If the audit forces 5 more candidates back into the queue and that exhausts budget, the resulting rows must say `budget exhausted: deferred to next invocation after kernels <X>, <Y>, <Z>` and name kernels that were actually committed in this invocation.
 
 ### Step 3: Aggregate benchmark refresh with 3-run median (~15% of budget — ARM64 host only)
 
@@ -541,7 +561,7 @@ Return a structured report with these sections, in this order:
 
 - **Baseline commit**: `$BASELINE_HASH` and the file path it covers.
 - **Host architecture**: `AMD64` / `ARM64` (determines what was measured vs. deferred).
-- **Rounds run**: N of 3 (`converged` / `budget exhausted` / `round cap hit`) — from Step 2.11.
+- **Rounds run**: N of <cap> (`converged` / `budget exhausted` / `round cap hit`) — from Step 2.11 (cap default 5, or `WOS_OPTIMIZER_ROUNDS`).
 - **Tier-S translations** — table: `file | x86 intrinsic counts (SSE / AES / SHA / CLMUL / CRC) | kernels total | kernels kept (passed gate) | kernels reverted by gate (with measured scalar/NEON numbers) | kernels deferred (with per-kernel reason) | commit hashes | NEON emitted (Y/N) | diff harness (bit-exact / within-tolerance / N/A)`. Empty if the project had no Tier-S files; do NOT omit the section.
 - **Functions optimized (Tier A)** — table: `function | file | line | language | category (SSE→NEON / AES-NI→vaes / SHA-NI→vsha / CLMUL→pmull / CRC32→__crc32* / scalar→NEON / fixed-point / fp-reduction / tier-s-hot-kernel / other) | commit hash | NEON emitted (Y/N from dumpbin) | per-kernel gate result (kept +N% / kept neutral / kept no-coverage / reverted scalar faster -N% / deferred host=AMD64) | diff harness (bit-exact / within-tolerance / N/A)`
 - **Functions / files reverted by per-kernel benchmark gate** — table: `function | file | scalar baseline (units) | neon median (units) | delta % (negative = NEON slower) | revert commit / git-checkout note`. This is the table that proves the gate is working; an empty table means either no kernel was slower than scalar (great) or the gate was deferred (host=AMD64 / no baseline).

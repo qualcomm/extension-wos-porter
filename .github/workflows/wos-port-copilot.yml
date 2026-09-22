@@ -1,0 +1,356 @@
+name: WoS Port (Windows ARM64, Copilot CLI)
+
+# A/B counterpart to wos-port.yml. Same pipeline, same artifacts, same
+# runner — swaps the backend from Anthropic Claude Code to GitHub Copilot
+# CLI (@github/copilot). The seven wos-* agents ship in this repo already
+# using Copilot frontmatter, so they drop straight into ~/.copilot/agents/
+# with no rewriting (unlike the Claude workflow, which had to convert them).
+#
+# Auth: requires a repo secret COPILOT_GITHUB_TOKEN containing a
+# fine-grained PAT (v2) with the "Copilot Requests" permission.
+# The built-in ${{ secrets.GITHUB_TOKEN }} does not carry that scope
+# and cannot be used here. See:
+# https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-command-reference
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo_url:
+        description: "GitHub repository to port (https://github.com/owner/repo or owner/repo)"
+        required: true
+        type: string
+      copilot_model:
+        description: "Copilot CLI model (auto, claude-sonnet-4.6, gpt-5.4, claude-haiku-4.5, gpt-5.3-codex, ...)"
+        required: false
+        type: string
+        default: "auto"
+      max_autopilot_continues:
+        description: "Max autopilot continuation messages before the CLI stops (analog of Claude --max-turns)"
+        required: false
+        type: string
+        default: "400"
+
+concurrency:
+  group: wos-port-copilot-${{ github.event.inputs.repo_url }}
+  cancel-in-progress: false
+
+jobs:
+  port:
+    name: Port ${{ github.event.inputs.repo_url }} to ARM64 (Copilot CLI)
+    runs-on: windows-11-arm
+    timeout-minutes: 360
+    env:
+      # Copilot CLI checks COPILOT_GITHUB_TOKEN > GH_TOKEN > GITHUB_TOKEN in
+      # that order. Set the first one explicitly so the built-in
+      # secrets.GITHUB_TOKEN doesn't accidentally get picked up (it lacks
+      # the "Copilot Requests" permission).
+      COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+      COPILOT_ALLOW_ALL: "true"
+      WOS_REPO_URL: ${{ github.event.inputs.repo_url }}
+      COPILOT_MODEL: ${{ github.event.inputs.copilot_model }}
+      MAX_AUTOPILOT_CONTINUES: ${{ github.event.inputs.max_autopilot_continues }}
+    steps:
+      - name: Checkout extension (for agent + instruction sources)
+        uses: actions/checkout@v4
+
+      - name: Verify COPILOT_GITHUB_TOKEN is set
+        shell: pwsh
+        run: |
+          if (-not $env:COPILOT_GITHUB_TOKEN) {
+            Write-Error "COPILOT_GITHUB_TOKEN secret is not configured on this repository. Create a fine-grained PAT with the 'Copilot Requests' permission and store it as a repo secret named COPILOT_GITHUB_TOKEN."
+            exit 1
+          }
+          Write-Host "COPILOT_GITHUB_TOKEN present (length=$($env:COPILOT_GITHUB_TOKEN.Length))"
+
+      - name: Set up Node.js (for Copilot CLI + npm-based build systems)
+        uses: actions/setup-node@v7
+        with:
+          node-version: 20
+
+      - name: Install GitHub Copilot CLI
+        shell: pwsh
+        run: |
+          npm install -g @github/copilot
+          copilot --version
+
+      - name: Show preinstalled ARM64 toolchain
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) {
+            $vswhere = "$env:ProgramFiles\Microsoft Visual Studio\Installer\vswhere.exe"
+          }
+          $vsPath = & $vswhere -latest -property installationPath
+          Write-Host "VS install: $vsPath"
+          $cl = Get-ChildItem "$vsPath\VC\Tools\MSVC" -Recurse -Filter cl.exe |
+                Where-Object { $_.FullName -match 'HostARM64\\ARM64' } |
+                Select-Object -First 1 -ExpandProperty FullName
+          if (-not $cl) {
+            $cl = Get-ChildItem "$vsPath\VC\Tools\MSVC" -Recurse -Filter cl.exe |
+                  Where-Object { $_.FullName -match 'Hostx64\\arm64' } |
+                  Select-Object -First 1 -ExpandProperty FullName
+          }
+          Write-Host "ARM64-target cl.exe: $cl"
+          Get-Command cmake, ninja, git, python -ErrorAction SilentlyContinue |
+            Format-Table Name, Source
+
+      - name: Install wos-* agents, instructions, skills, and prompts into ~/.copilot
+        shell: pwsh
+        run: |
+          $workRoot = "C:\src\wos-porter"
+          New-Item -ItemType Directory -Force -Path $workRoot | Out-Null
+
+          # Copilot CLI's user-level custom asset locations mirror the VS Code
+          # extension's install targets in src/extension.ts:
+          #   ~/.copilot/agents, ~/.copilot/instructions, ~/.copilot/skills, ~/.copilot/prompts
+          $userHome  = $env:USERPROFILE
+          $agentsDst = Join-Path $userHome ".copilot\agents"
+          $instrDst  = Join-Path $userHome ".copilot\instructions"
+          $skillsDst = Join-Path $userHome ".copilot\skills"
+          $promptsDst = Join-Path $userHome ".copilot\prompts"
+          New-Item -ItemType Directory -Force -Path $agentsDst | Out-Null
+          New-Item -ItemType Directory -Force -Path $instrDst  | Out-Null
+          New-Item -ItemType Directory -Force -Path $skillsDst | Out-Null
+          New-Item -ItemType Directory -Force -Path $promptsDst | Out-Null
+
+          # Strip Copilot-incompatible frontmatter keys during install:
+          #   - tools:            Claude-style tool names (execute, search, web,
+          #                       agent, todo) don't exist in Copilot CLI. Removing
+          #                       the line lets the agent inherit ALL tools, which
+          #                       is what --allow-all-tools already permits.
+          #   - agents:           Not a Copilot CLI frontmatter key. Delegation to
+          #                       subagents happens via the built-in `task` tool
+          #                       once all seven agents are visible in ~/.copilot/agents.
+          #   - argument-hint:    Skill-only field; harmless on agents but noise.
+          #   - user-invocable:   Not a Copilot CLI agent key.
+          Get-ChildItem "$env:GITHUB_WORKSPACE\agents\wos-*.agent.md" | ForEach-Object {
+            $srcPath  = $_.FullName
+            $dstPath  = Join-Path $agentsDst $_.Name
+
+            $raw = Get-Content -Raw -LiteralPath $srcPath
+            if ($raw -notmatch '(?s)^---\r?\n(.*?)\r?\n---\r?\n(.*)$') {
+              Write-Error "No YAML frontmatter in $srcPath"
+              exit 1
+            }
+            $fm   = $Matches[1]
+            $body = $Matches[2]
+
+            $fmLines = $fm -split "`r?`n" | Where-Object {
+              $_ -notmatch '^\s*(tools|agents|argument-hint|user-invocable)\s*:'
+            }
+            $newFm = ($fmLines -join "`n").Trim()
+            $out   = "---`n$newFm`n---`n$body"
+            Set-Content -LiteralPath $dstPath -Value $out -Encoding UTF8
+            Write-Host "Installed Copilot subagent: $dstPath"
+          }
+
+          Copy-Item "$env:GITHUB_WORKSPACE\instructions\*.instructions.md" `
+            -Destination $instrDst -Force
+
+          # Skills: each is a directory containing a SKILL.md (plus assets).
+          # Copy the whole directory tree so referenced assets come along.
+          Get-ChildItem "$env:GITHUB_WORKSPACE\skills" -Directory | ForEach-Object {
+            $dst = Join-Path $skillsDst $_.Name
+            Copy-Item $_.FullName -Destination $dst -Recurse -Force
+            Write-Host "Installed skill: $dst"
+          }
+
+          # Prompts: flat *.prompt.md files.
+          if (Test-Path "$env:GITHUB_WORKSPACE\prompts") {
+            Copy-Item "$env:GITHUB_WORKSPACE\prompts\*.prompt.md" `
+              -Destination $promptsDst -Force -ErrorAction SilentlyContinue
+          }
+
+          Write-Host "--- Installed agents ---"
+          Get-ChildItem $agentsDst | Select-Object FullName
+          Write-Host "--- Installed instructions ---"
+          Get-ChildItem $instrDst | Select-Object FullName
+          Write-Host "--- Installed skills ---"
+          Get-ChildItem $skillsDst -Directory | Select-Object FullName
+          Write-Host "--- Installed prompts ---"
+          Get-ChildItem $promptsDst -ErrorAction SilentlyContinue | Select-Object FullName
+
+          # Expose the instructions directory to Copilot CLI. Only
+          # .github/instructions/ inside a repo is auto-discovered; for a
+          # user-level directory we set COPILOT_CUSTOM_INSTRUCTIONS_DIRS.
+          # Skills (~/.copilot/skills) and agents (~/.copilot/agents) are picked
+          # up from those user-level dirs directly, the same way the agents in
+          # ~/.copilot/agents already load — no extra env var needed.
+          "COPILOT_CUSTOM_INSTRUCTIONS_DIRS=$instrDst" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Run wos-porter headless (Copilot CLI)
+        working-directory: C:\src\wos-porter
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $logDir = "C:\src\wos-porter\_logs"
+          New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+
+          # -p (programmatic mode): non-interactive, exits when done —
+          #    Copilot CLI's analog of `claude -p`.
+          # --agent=wos-porter: switch to the main orchestrator subagent.
+          #    Its system prompt (agents/wos-porter.agent.md) already
+          #    defines the full 8-phase pipeline, so we only need to
+          #    pass the repository URL as input — the agent takes it
+          #    from there.
+          # --allow-all-tools: required in programmatic mode; equivalent
+          #    to `claude --dangerously-skip-permissions`. The runner is
+          #    single-use and ephemeral, so blast radius is bounded.
+          # --autopilot + --max-autopilot-continues: keep the agent
+          #    running through the multi-phase pipeline without asking
+          #    for continuation input; analog of Claude's --max-turns.
+          # --output-format=json: emit JSONL (one JSON object per line),
+          #    analog of Claude's --output-format stream-json.
+          $prompt = "Port this repository to Windows ARM64: $env:WOS_REPO_URL"
+
+          Write-Host "Prompt: $prompt"
+          Write-Host "Model:  $env:COPILOT_MODEL"
+
+          copilot `
+            -p $prompt `
+            --agent=wos-porter `
+            --model=$env:COPILOT_MODEL `
+            --autopilot `
+            --max-autopilot-continues ([int]$env:MAX_AUTOPILOT_CONTINUES) `
+            --allow-all-tools `
+            --allow-all-paths `
+            --allow-all-urls `
+            --output-format=json `
+            --log-dir=$logDir `
+            --log-level=info `
+            2>&1 |
+            Tee-Object -FilePath (Join-Path $logDir "copilot-run.jsonl")
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "copilot exited with code $LASTEXITCODE — artifacts will still be uploaded for inspection."
+          }
+
+      - name: Locate ported repo
+        id: locate
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $portedRoot = "C:\src\wos-porter"
+          if (-not (Test-Path $portedRoot)) {
+            Write-Warning "$portedRoot does not exist — the porter step never ran or failed before cloning."
+            "ported_repo=" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            exit 0
+          }
+          $candidates = Get-ChildItem -Directory $portedRoot -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -ne '_logs' -and (Test-Path (Join-Path $_.FullName '.git')) }
+          if (-not $candidates) {
+            Write-Warning "No cloned repo found under $portedRoot — porter never got past Phase 1."
+            "ported_repo=" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            exit 0
+          }
+          $ported = $candidates | Select-Object -First 1
+          Write-Host "Ported repo: $($ported.FullName)"
+          "ported_repo=$($ported.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "ported_name=$($ported.Name)"     | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Generate arm64-port patch + summary
+        if: always() && steps.locate.outputs.ported_repo != ''
+        working-directory: ${{ steps.locate.outputs.ported_repo }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $outDir = "C:\src\wos-porter\_artifacts"
+          $seriesDir = Join-Path $outDir "patches"
+          New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+
+          # The porter does all its work on the 'arm64-port' branch, forked from
+          # the repo's default branch. Confirm that branch exists first.
+          $port = 'arm64-port'
+          $portSha = (git rev-parse --verify --quiet "refs/heads/$port")
+          if (-not $portSha) {
+            Write-Warning "Branch '$port' not found — the porter never created it (likely failed before/at Phase 1). Capturing a working-tree diff instead so there's still something to inspect."
+            git status | Tee-Object (Join-Path $outDir "git-status.txt") | Out-Null
+            git diff --binary HEAD | Out-File -Encoding ascii (Join-Path $outDir "working-tree.diff")
+            exit 0
+          }
+
+          # Resolve the BASE ref the port forked from. Must never be the port
+          # branch itself (that yields an empty patch — the classic bug). Try the
+          # usual defaults and the remote HEAD, excluding arm64-port.
+          $base = $null
+          foreach ($cand in @('main','master','origin/main','origin/master','origin/HEAD')) {
+            if ($cand -eq $port) { continue }
+            $sha = (git rev-parse --verify --quiet $cand)
+            if ($sha) { $base = $cand; break }
+          }
+          if (-not $base) {
+            Write-Warning "Could not resolve a base branch (main/master/origin). Falling back to the parent of the first arm64-port commit."
+            $base = (git rev-list --max-parents=0 "$port" | Select-Object -Last 1)  # root commit
+          }
+
+          # Use the true fork point so the patch contains ONLY the porter's work,
+          # not unrelated commits that landed on the base after the fork.
+          $forkPoint = (git merge-base $base $port).Trim()
+          if (-not $forkPoint) { $forkPoint = $base }
+          Write-Host "Base ref: $base   fork point: $forkPoint   port tip: $portSha"
+
+          $range = "$forkPoint..$port"
+          $commitCount = [int](git rev-list --count $range)
+          Write-Host "Commits on $port since fork: $commitCount"
+
+          git log --oneline $range | Tee-Object (Join-Path $outDir "commits.txt")
+          git diff --stat $range   | Tee-Object (Join-Path $outDir "diffstat.txt")
+
+          if ($commitCount -eq 0) {
+            Write-Warning "No commits on '$port' beyond the base — nothing to turn into a patch. The porter may have applied changes but never committed them; capturing the working-tree diff as a fallback."
+            git diff --binary $range | Out-File -Encoding ascii (Join-Path $outDir "arm64-port.diff")
+            git diff --binary HEAD   | Out-File -Encoding ascii (Join-Path $outDir "working-tree.diff")
+          } else {
+            # Two artifacts: a single combined diff (git apply) and the per-commit
+            # mbox series (git am). Write the combined patch with .NET so PS 5.1
+            # doesn't inject a UTF-8 BOM that breaks `git apply`.
+            $combined = Join-Path $outDir "arm64-port.patch"
+            $diffText = (git diff --binary $range | Out-String)
+            [System.IO.File]::WriteAllText($combined, $diffText, (New-Object System.Text.UTF8Encoding($false)))
+            Write-Host "Wrote combined patch: $combined"
+
+            New-Item -ItemType Directory -Force -Path $seriesDir | Out-Null
+            $series = git format-patch $range -o $seriesDir
+            Write-Host "Wrote $($series.Count) per-commit patch file(s) to $seriesDir"
+          }
+
+          if (Test-Path "ARM64-PORT.md") {
+            Copy-Item "ARM64-PORT.md" (Join-Path $outDir "ARM64-PORT.md") -Force
+          } else {
+            Write-Warning "ARM64-PORT.md was not produced — Phase 8 did not complete."
+          }
+
+      - name: Upload run log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: copilot-run-log
+          path: C:\src\wos-porter\_logs\**
+          if-no-files-found: warn
+
+      - name: Upload ARM64 port artifacts (patch + report)
+        if: always() && steps.locate.outputs.ported_repo != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: arm64-port-copilot-${{ steps.locate.outputs.ported_name }}
+          path: C:\src\wos-porter\_artifacts\**
+          if-no-files-found: warn
+
+      - name: Upload full ported working tree (branch arm64-port)
+        if: always() && steps.locate.outputs.ported_repo != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: ported-repo-copilot-${{ steps.locate.outputs.ported_name }}
+          path: |
+            ${{ steps.locate.outputs.ported_repo }}/**
+            !${{ steps.locate.outputs.ported_repo }}/**/node_modules/**
+            !${{ steps.locate.outputs.ported_repo }}/**/target/**
+            !${{ steps.locate.outputs.ported_repo }}/**/build/**
+            !${{ steps.locate.outputs.ported_repo }}/**/build-arm64/**
+            !${{ steps.locate.outputs.ported_repo }}/**/out/**
+            !${{ steps.locate.outputs.ported_repo }}/**/x64/**
+            !${{ steps.locate.outputs.ported_repo }}/**/Debug/**
+            !${{ steps.locate.outputs.ported_repo }}/**/Release/**
+          if-no-files-found: warn

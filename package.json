@@ -2,7 +2,7 @@
   "name": "wos-porter",
   "displayName": "WoS Porter - Windows ARM64 Porting Agent",
   "description": "AI-powered agents that automatically port open-source x64 Windows applications to native ARM64. Analyzes repos, ports build systems and source code, builds, validates binaries, and runs tests.",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "publisher": "wos-porter",
   "license": "BSD-3-Clause-Clear",
   "repository": {
