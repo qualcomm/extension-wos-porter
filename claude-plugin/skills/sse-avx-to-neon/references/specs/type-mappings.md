@@ -304,8 +304,8 @@ for (int i = 0; i < 16; i++)
 | SSE/AVX intrinsic | NEON intrinsic | Guard |
 |---|---|---|
 | `_mm_fmadd_ps(a,b,c)` | `vfmaq_f32(c, a, b)` | A32V8 or A64V8 |
-| `_mm_fmsub_ps(a,b,c)` | `vfmsq_f32(c, a, b)` | A32V8 or A64V8 |
-| `_mm_fnmadd_ps(a,b,c)` | `vfmsq_f32(c, a, b)` → negate | |
+| `_mm_fmsub_ps(a,b,c)` | `vfmaq_f32(vnegq_f32(c), a, b)` | A32V8 or A64V8 |
+| `_mm_fnmadd_ps(a,b,c)` | `vfmsq_f32(c, a, b)` | A32V8 or A64V8 |
 | `_mm_fmadd_pd(a,b,c)` | `vfmaq_f64(c, a, b)` | A64V8 |
 | `_mm_floor_ps` | `vrndmq_f32` | A64V8; A32V7: scalar |
 | `_mm_ceil_ps` | `vrndpq_f32` | A64V8 |
