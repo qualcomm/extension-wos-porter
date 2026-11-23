@@ -405,7 +405,8 @@ specs:
       - _mm_floor_ps / _mm_ceil_ps / _mm_round_ps
     arm64_constructs:
       - "vfmaq_f32(c, a, b)  # operand order: accumulator first"
-      - "vfmsq_f32(c, a, b)"
+      - "vfmaq_f32(vnegq_f32(c), a, b)  # fmsub: a*b - c"
+      - "vfmsq_f32(c, a, b)  # fnmadd: c - a*b"
       - "vrndmq_f32 (floor) / vrndpq_f32 (ceil) / vrndnq_f32 (round-to-nearest)"
     pitfalls:
       - NEON FMA accumulator is first operand (c, a, b) — SSE FMA is (a, b, c)
